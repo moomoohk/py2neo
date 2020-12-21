@@ -466,7 +466,7 @@ class ConnectionPool(object):
                     # caller to make an alternative choice.
                     log.debug("Pool %r is full with all connections "
                               "in use", self)
-                    return ConnectionUnavailable("Pool is full")
+                    raise ConnectionUnavailable("Pool is full")
             else:
                 cx = self._sanitize(cx, force_reset=force_reset)
         log.debug("Acquired connection %r", cx)
@@ -489,26 +489,27 @@ class ConnectionPool(object):
         if cx in self._free_list or cx in self._quarantine:
             return
         log.debug("Releasing connection %r", cx)
-        if cx in self._in_use_list:
-            self._in_use_list.remove(cx)
-            if self.size < self.max_size:
-                # If there is spare capacity in the pool, attempt to
-                # sanitize the connection and return it to the pool.
-                cx = self._sanitize(cx, force_reset=force_reset)
-                if cx:
-                    # Carry on only if sanitation succeeded.
-                    if self.size < self.max_size:
-                        # Check again if there is still capacity.
-                        self._free_list.append(cx)
-                        pass  # Removed waiting list mechanism (11 Nov 2020)
-                    else:
-                        # Otherwise, close the connection.
-                        cx.close()
-            else:
-                # If the pool is full, simply close the connection.
-                cx.close()
+        if cx not in self._in_use_list:
+            # Connection does not belong to this pool
+            log.debug("Connection %r does not belong to pool %r", cx, self)
+            return
+        self._in_use_list.remove(cx)
+        if self.size < self.max_size:
+            # If there is spare capacity in the pool, attempt to
+            # sanitize the connection and return it to the pool.
+            cx = self._sanitize(cx, force_reset=force_reset)
+            if cx:
+                # Carry on only if sanitation succeeded.
+                if self.size < self.max_size:
+                    # Check again if there is still capacity.
+                    self._free_list.append(cx)
+                    pass  # Removed waiting list mechanism (11 Nov 2020)
+                else:
+                    # Otherwise, close the connection.
+                    cx.close()
         else:
-            raise ValueError("Connection %r does not belong to this pool" % cx)
+            # If the pool is full, simply close the connection.
+            cx.close()
 
     def prune(self):
         """ Close all free connections.
@@ -875,8 +876,13 @@ class Connector(object):
                 log.debug("Removing profile %r from routing table for %s", profile,
                           "default database" if graph_name is None else repr(graph_name))
                 routing_table.remove(profile)
-        log.debug("Pruning idle connections to %r", profile)
-        self._pools[profile].prune()
+        try:
+            pool = self._pools[profile]
+        except KeyError:
+            pass  # no such pool
+        else:
+            log.debug("Pruning idle connections to %r", profile)
+            pool.prune()
 
     def begin(self, graph_name, readonly=False,
               # after=None, metadata=None, timeout=None
@@ -925,14 +931,12 @@ class Connector(object):
             self.prune(cx.profile)
             raise
 
-    def auto_run(self, graph_name, cypher, parameters=None, readonly=False, hydrant=None,
+    def auto_run(self, graph_name, cypher, parameters=None, readonly=False,
                  # after=None, metadata=None, timeout=None
                  ):
         """ Run a Cypher query within a new auto-commit transaction.
         """
         cx = self.acquire(graph_name, readonly)
-        if hydrant:
-            parameters = hydrant.dehydrate(parameters, version=cx.protocol_version)
         result = cx.auto_run(graph_name, cypher, parameters, readonly=readonly)
         cx.pull(result)
         try:
@@ -944,12 +948,10 @@ class Connector(object):
         else:
             return result
 
-    def run_in_tx(self, tx, cypher, parameters=None, hydrant=None):
+    def run_in_tx(self, tx, cypher, parameters=None):
         """ Run a Cypher query within an open explicit transaction.
         """
         cx = self._get_connection(tx)
-        if hydrant:
-            parameters = hydrant.dehydrate(parameters, version=cx.protocol_version)
         result = cx.run_in_tx(tx, cypher, parameters)
         cx.pull(result)
         try:

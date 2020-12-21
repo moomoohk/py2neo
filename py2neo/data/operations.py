@@ -16,12 +16,27 @@
 # limitations under the License.
 
 
+"""
+This module contains functions used to carry out basic data operations
+such as creating or merging nodes, as well as operations on full
+subgraphs. Each operation typically accepts a transaction object as its
+first argument; it is in this transaction that the operation is carried
+out. The remainder of the arguments depend on the nature of the
+operation.
+
+Many of these functions wrap well-tuned Cypher queries, and can avoid
+the need to manually implement these operations. As an example,
+:func:`.create_nodes` uses the fast ``UNWIND ... CREATE`` method to
+iterate through a list of raw node data and create each node in turn.
+"""
+
 from __future__ import absolute_import
 
 
 __all__ = [
     "create_nodes",
     "merge_nodes",
+    "create_relationships",
     "merge_relationships",
     "create_subgraph",
     "delete_subgraph",
@@ -33,8 +48,12 @@ __all__ = [
     "UniquenessError",
 ]
 
-
-from py2neo.cypher import cypher_escape, cypher_repr, Literal
+from py2neo.cypher import cypher_escape, cypher_join
+from py2neo.cypher.queries import (
+    unwind_create_nodes_query,
+    unwind_merge_nodes_query,
+    unwind_create_relationships_query,
+    unwind_merge_relationships_query)
 
 
 def _node_create_dict(nodes):
@@ -84,83 +103,206 @@ def _rel_create_dict(relationships):
     return d
 
 
-def _label_string(labels, primary_label=None):
-    label_set = set(labels or ())
-    if primary_label:
-        label_set.add(primary_label)
-    return "".join(":" + cypher_escape(label) for label in sorted(label_set))
-
-
 def create_nodes(tx, data, labels=None, keys=None):
     """ Create nodes from an iterable sequence of raw node data.
 
-    :param tx:
-    :param data:
-    :param labels: 
-    :param keys:
-    :returns:
+    The raw node `data` is supplied as either a list of lists or a list
+    of dictionaries. If the former, then a list of `keys` must also be
+    provided in the same order as the values. This option will also
+    generally require fewer bytes to be sent to the server, since key
+    duplication is removed.
+
+    An iterable of extra `labels` can also be supplied, which will be
+    attached to all new nodes.
+
+    The example code below shows how to pass raw node data as a list of
+    lists:
+
+        >>> from py2neo import Graph
+        >>> from py2neo.data.operations import create_nodes
+        >>> g = Graph()
+        >>> keys = ["name", "age"]
+        >>> data = [
+            ["Alice", 33],
+            ["Bob", 44],
+            ["Carol", 55],
+        ]
+        >>> create_nodes(g.auto(), data, labels={"Person"}, keys=keys)
+        >>> g.nodes.match("Person").count()
+        3
+
+    This second example shows how to pass raw node data as a list of
+    dictionaries. This alternative can be particularly useful if the
+    fields are not uniform across records.
+
+        >>> data = [
+            {"name": "Dave", "age": 66},
+            {"name": "Eve", "date_of_birth": "1943-10-01"},
+            {"name": "Frank"},
+        ]
+        >>> create_nodes(g.auto(), data, labels={"Person"})
+        >>> g.nodes.match("Person").count()
+        6
+
+    There are obviously practical limits to the amount of data that
+    should be included in a single bulk load of this type. For that
+    reason, it is advisable to batch the input data into chunks, and
+    carry out each in a separate transaction.
+
+    The example below shows how batching can be achieved using a simple
+    loop. This code assumes that `data` is an iterable of raw node data
+    (lists of values) and steps through that data in chunks of size
+    `batch_size` until everything has been consumed.
+
+        >>> from itertools import islice
+        >>> stream = iter(data)
+        >>> batch_size = 10000
+        >>> while True:
+        ...     batch = islice(stream, batch_size)
+        ...     if batch:
+        ...         create_nodes(g.auto(), batch, labels={"Person"})
+        ...     else:
+        ...         break
+
+    There is no universal `batch_size` that performs optimally for all
+    use cases. It is recommended to experiment with this value to
+    discover what size works best.
+
+    :param tx: :class:`.Transaction` in which to carry out this
+        operation
+    :param data: node data supplied as a list of lists (if `keys` are
+        provided) or a list of dictionaries (if `keys` is :const:`None`)
+    :param labels: labels to apply to the created nodes
+    :param keys: an optional set of keys for the supplied `data`
     """
-    if keys:
-        # data is list of lists
-        fields = [Literal("r[%d]" % i) for i in range(len(keys))]
-        set_rhs = cypher_repr(dict(zip(keys, fields)))
-    else:
-        # data is list of dicts
-        set_rhs = "r"
-    cypher = ("UNWIND $data AS r "
-              "CREATE (_%s) "
-              "SET _ = %s "
-              "RETURN id(_)" % (_label_string(labels), set_rhs))
-    for record in tx.run(cypher, data=list(data)):
-        yield record[0]
+    list(tx.run(*unwind_create_nodes_query(data, labels, keys)))
 
 
-def merge_nodes(tx, data, primary_label, primary_key, labels=None, keys=None):
+def merge_nodes(tx, data, merge_key, labels=None, keys=None):
     """ Merge nodes from an iterable sequence of raw node data.
 
-    :param tx:
-    :param data: list of properties
-    :param primary_label:
-    :param primary_key:
-    :param labels:
+    In a similar way to :meth:`.create_nodes`, the raw node `data` can
+    be supplied as either lists (with `keys`) or dictionaries. This
+    method however uses an ``UNWIND ... MERGE`` construct in the
+    underlying Cypher query to create or update nodes depending
+    on what already exists.
+
+    The merge is performed on the basis of the label and keys
+    represented by the `merge_key`, updating a node if that combination
+    is already present in the graph, and creating a new node otherwise.
+    As with :meth:`.create_nodes`, extra `labels` may also be
+    specified; these will be applied to all nodes, pre-existing or new.
+    The label included in the `merge_key` does not need to be
+    separately included here.
+
+    The example code below shows a simple merge based on a `Person`
+    label and a `name` property:
+
+        >>> from py2neo import Graph
+        >>> from py2neo.data.operations import merge_nodes
+        >>> g = Graph()
+        >>> keys = ["name", "age"]
+        >>> data = [
+            ["Alice", 33],
+            ["Bob", 44],
+            ["Carol", 55],
+            ["Carol", 66],
+            ["Alice", 77],
+        ]
+        >>> merge_nodes(g.auto(), data, ("Person", "name"), keys=keys)
+        >>> g.nodes.match("Person").count()
+        3
+
+    :param tx: :class:`.Transaction` in which to carry out this
+        operation
+    :param data: node data supplied as a list of lists (if `keys` are
+        provided) or a list of dictionaries (if `keys` is :const:`None`)
+    :param merge_key: tuple of (label, key1, key2...) on which to merge
+    :param labels: additional labels to apply to the merged nodes
+    :param keys: an optional set of keys for the supplied `data`
+    """
+    list(tx.run(*unwind_merge_nodes_query(data, merge_key, labels, keys)))
+
+
+def create_relationships(tx, data, rel_type, keys=None, start_node_key=None, end_node_key=None):
+    """ Create relationships from an iterable sequence of raw
+    relationship data.
+
+    The raw relationship `data` is supplied as a list of triples (or
+    3-item lists), each representing (start_node, detail, end_node).
+    The `rel_type` specifies the type of relationship to create, and is
+    fixed for the entire data set.
+
+    Start and end node information can either be provided as an
+    internal node ID or, in conjunction with a `start_node_key` or
+    `end_node_key`, a tuple or list of property values to ``MATCH``.
+    For example, to link people to their place of work, the code below
+    could be used:
+
+        >>> from py2neo import Graph
+        >>> from py2neo.data.operations import create_relationships
+        >>> g = Graph()
+        >>> data = [
+            (("Alice", "Smith"), {"since": 1999}, "ACME"),
+            (("Bob", "Jones"), {"since": 2002}, "Bob Corp"),
+            (("Carol", "Singer"), {"since": 1981}, "The Daily Planet"),
+        ]
+        >>> create_relationships(g.auto(), data, "WORKS_FOR", \
+            start_node_key=("Person", "name", "family name"), \
+            end_node_key=("Company", "name"))
+
+    If the company node IDs were already known, the code could instead
+    look like this:
+
+        >>> data = [
+            (("Alice", "Smith"), {"since": 1999}, 123),
+            (("Bob", "Jones"), {"since": 2002}, 124),
+            (("Carol", "Singer"), {"since": 1981}, 201),
+        ]
+        >>> create_relationships(g.auto(), data, "WORKS_FOR", \
+            start_node_key=("Person", "name", "family name"))
+
+    As with other methods, such as :meth:`.create_nodes`, the
+    relationship `data` can also be supplied as a list of property
+    values, indexed by `keys`. This can avoid sending duplicated key
+    names over the network, and alters the method call as follows:
+
+        >>> data = [
+            (("Alice", "Smith"), [1999], 123),
+            (("Bob", "Jones"), [2002], 124),
+            (("Carol", "Singer"), [1981], 201),
+        ]
+        >>> create_relationships(g.auto(), data, "WORKS_FOR", keys=["since"] \
+            start_node_key=("Person", "name", "family name"))
+
+    :param tx: :class:`.Transaction` in which to carry out this
+        operation
+    :param data:
+    :param rel_type:
     :param keys:
-    :returns:
-    """
-    if keys:
-        # data is list of lists
-        primary_index = keys.index(primary_key)
-        fields = [Literal("r[%d]" % i) for i in range(len(keys))]
-        set_rhs = cypher_repr(dict(zip(keys, fields)))
-    else:
-        # data is list of dicts
-        primary_index = primary_key
-        set_rhs = "r"
-    cypher = ("UNWIND $data AS r "
-              "MERGE (_:%s {%s:r[$key]}) "
-              "SET _%s "
-              "SET _ = %s "
-              "RETURN id(_)" % (cypher_escape(primary_label),
-                                cypher_escape(primary_key),
-                                _label_string(labels, primary_label),
-                                set_rhs))
-    for record in tx.run(cypher, data=data, key=primary_index):
-        yield record[0]
-
-
-def merge_relationships(tx, r_type, data):
-    """
-
-    :param tx:
-    :param r_type:
-    :param data: list of (a_id, b_id, properties)
+    :param start_node_key:
+    :param end_node_key:
     :return:
     """
-    cypher = ("UNWIND $data AS r "
-              "MATCH (a) WHERE id(a) = r[0] "
-              "MATCH (b) WHERE id(b) = r[1] "
-              "MERGE (a)-[_:%s]->(b) SET _ = r[2] RETURN id(_)" % cypher_escape(r_type))
-    for record in tx.run(cypher, data=data):
-        yield record[0]
+    list(tx.run(*unwind_create_relationships_query(data, rel_type, keys,
+                                                   start_node_key, end_node_key)))
+
+
+def merge_relationships(tx, data, merge_key, keys=None, start_node_key=None, end_node_key=None):
+    """ Merge relationships from an iterable sequence of raw
+    relationship data.
+
+    :param tx: :class:`.Transaction` in which to carry out this
+        operation
+    :param data:
+    :param merge_key:
+    :param keys:
+    :param start_node_key:
+    :param end_node_key:
+    :return:
+    """
+    list(tx.run(*unwind_create_relationships_query(data, merge_key, keys,
+                                                   start_node_key, end_node_key)))
 
 
 def create_subgraph(tx, subgraph):
@@ -173,19 +315,22 @@ def create_subgraph(tx, subgraph):
     """
     graph = tx.graph
     for labels, nodes in _node_create_dict(n for n in subgraph.nodes if n.graph is None).items():
-        identities = create_nodes(tx, list(map(dict, nodes)), labels)
-        for i, identity in enumerate(identities):
+        pq = unwind_create_nodes_query(list(map(dict, nodes)), labels=labels)
+        pq = cypher_join(pq, "RETURN id(_)")
+        records = tx.run(*pq)
+        for i, record in enumerate(records):
             node = nodes[i]
             node.graph = graph
-            node.identity = identity
+            node.identity = record[0]
             node._remote_labels = labels
     for r_type, relationships in _rel_create_dict(r for r in subgraph.relationships if r.graph is None).items():
-        identities = merge_relationships(tx, r_type, list(map(
-            lambda r: [r.start_node.identity, r.end_node.identity, dict(r)], relationships)))
-        for i, identity in enumerate(identities):
+        data = map(lambda r: [r.start_node.identity, dict(r), r.end_node.identity], relationships)
+        pq = unwind_merge_relationships_query(data, r_type)
+        pq = cypher_join(pq, "RETURN id(_)")
+        for i, record in enumerate(tx.run(*pq)):
             relationship = relationships[i]
             relationship.graph = graph
-            relationship.identity = identity
+            relationship.identity = record[0]
 
 
 def merge_subgraph(tx, subgraph, p_label, p_key):
@@ -202,7 +347,9 @@ def merge_subgraph(tx, subgraph, p_label, p_key):
     for (pl, pk, labels), nodes in _node_merge_dict(p_label, p_key, (n for n in subgraph.nodes if n.graph is None)).items():
         if pl is None or pk is None:
             raise ValueError("Primary label and primary key are required for MERGE operation")
-        identities = list(merge_nodes(tx, list(map(dict, nodes)), pl, pk, labels))
+        pq = unwind_merge_nodes_query(map(dict, nodes), (pl, pk), labels)
+        pq = cypher_join(pq, "RETURN id(_)")
+        identities = [record[0] for record in tx.run(*pq)]
         if len(identities) > len(nodes):
             raise UniquenessError("Found %d matching nodes for primary label %r and primary "
                                   "key %r with labels %r but merging requires no more than "
@@ -213,12 +360,13 @@ def merge_subgraph(tx, subgraph, p_label, p_key):
             node.identity = identity
             node._remote_labels = labels
     for r_type, relationships in _rel_create_dict(r for r in subgraph.relationships if r.graph is None).items():
-        identities = merge_relationships(tx, r_type, list(map(
-            lambda r: [r.start_node.identity, r.end_node.identity, dict(r)], relationships)))
-        for i, identity in enumerate(identities):
+        data = map(lambda r: [r.start_node.identity, dict(r), r.end_node.identity], relationships)
+        pq = unwind_merge_relationships_query(data, r_type)
+        pq = cypher_join(pq, "RETURN id(_)")
+        for i, record in enumerate(tx.run(*pq)):
             relationship = relationships[i]
             relationship.graph = graph
-            relationship.identity = identity
+            relationship.identity = record[0]
 
 
 def delete_subgraph(tx, subgraph):
